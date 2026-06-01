@@ -1,7 +1,8 @@
 """
-Maono PD100X - Mute LED Mod v2.0
+Maono PD100X - Mute LED Mod v3.0
 =================================
 Cambia el LED del microfono segun el boton fisico de mute.
+Puede correr con o sin Maono Link abierto.
 
 CONFIGURACION (edita esta seccion):
 """
@@ -9,18 +10,29 @@ CONFIGURACION (edita esta seccion):
 # ── Color cuando MUTEADO ─────────────────────────────────────────────────────
 #   0=naranja  1=verde  2=teal  3=morado  4=rainbow
 #   5=naranja-pulse  6=verde-pulse  7=teal-pulse  8=morado-pulse  9=rainbow-pulse
-#   No hay rojo en el firmware — naranja es lo mas cercano.
+#   No hay rojo solido en el firmware — naranja es lo mas cercano.
 COLOR_MUTED = 0   # naranja
 
 # ── Modo cuando ACTIVO ───────────────────────────────────────────────────────
-#   Mismos colores 0-9 de arriba, O uno de los modos dinamicos:
-#   10=Dynamic I  11=Dynamic II  12=Level Meter (reacciona al audio!)
-COLOR_ACTIVE = 12  # Level Meter — reacciona al audio cuando no estas muteado
+#   Colores estaticos: 0-4  |  Pulse: 5-9
+#   Dinamicos: 10=Dynamic I  11=Dynamic II  12=Level Meter (reacciona al audio)
+COLOR_ACTIVE = 12  # Level Meter
+
+# ── Esquema RGB para modos dinamicos (0-9) ───────────────────────────────────
+#   Solo aplica cuando COLOR_ACTIVE >= 10 (Dynamic/Level Meter).
+#   Todos los esquemas muestran el espectro RGB completo con distintos patrones.
+#   Solo funciona si Maono Link esta corriendo (el necesita inicializar el device).
+#   Si Maono Link no esta activo, se ignora este parametro.
+COLOR_SCHEME = 0   # 0-9, prueba distintos para ver la diferencia
 
 # ─────────────────────────────────────────────────────────────────────────────
 
 import sys
 import os
+import ctypes
+import ctypes.wintypes as wt
+import time
+import hid
 
 _LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maono_mute_led.log")
 if sys.stdout is None or not hasattr(sys.stdout, 'reconfigure'):
@@ -29,15 +41,11 @@ if sys.stdout is None or not hasattr(sys.stdout, 'reconfigure'):
 else:
     sys.stdout.reconfigure(encoding='utf-8')
 
-import ctypes
-import ctypes.wintypes as wt
-import time
-import hid
-
 VID = 0x352F
 PID = 0x0108
-CMD_LED   = 0x38
-CMD_POWER = 0x36
+CMD_LED    = 0x38
+CMD_SCHEME = 0x39
+CMD_POWER  = 0x36
 STATUS_REPORT_TYPE = 34   # b6=0x22
 
 
@@ -45,6 +53,15 @@ def _make_cmd(cmd: int, param: int) -> bytes:
     checksum = (270 - cmd - param) % 256
     return bytes([0x4B, 0xC4, 0x0B, 0x00, 0x00, 0x03,
                   cmd, 0x20, param, 0x00, checksum, 0xFE]) + bytes(52)
+
+
+def is_maono_link_running() -> bool:
+    import subprocess
+    result = subprocess.run(
+        ['tasklist', '/FI', 'IMAGENAME eq Maono Link2.0.exe', '/NH'],
+        capture_output=True, text=True
+    )
+    return 'Maono Link2.0.exe' in result.stdout
 
 
 def open_device():
@@ -67,7 +84,7 @@ def open_device():
 
     writer = k32.CreateFileA(path, 0xC0000000, 0x3, None, 3, 0x40000000, None)
     if ctypes.get_last_error() != 0:
-        print(f"ERROR abriendo HID: {ctypes.get_last_error()} — cierra Maono Link.")
+        print(f"ERROR abriendo HID: {ctypes.get_last_error()}")
         sys.exit(1)
 
     return k32, writer, reader
@@ -94,6 +111,15 @@ def send_led(k32, handle, cmd: int, param: int):
     k32.CloseHandle(evt)
 
 
+def apply_active_mode(k32, handle, maono_running: bool):
+    """Aplica el modo activo, con esquema RGB si Maono Link esta disponible."""
+    if COLOR_ACTIVE >= 10 and maono_running:
+        # Modo dinamico + esquema RGB (requiere inicializacion de Maono Link)
+        send_led(k32, handle, CMD_SCHEME, COLOR_SCHEME)
+        time.sleep(0.05)
+    send_led(k32, handle, CMD_LED, COLOR_ACTIVE)
+
+
 def read_mute_state(reader: hid.device):
     """Lee el reporte de estado (b6=0x22). Retorna True/False/None."""
     deadline = time.time() + 1.5
@@ -114,11 +140,17 @@ def main():
     active_label = labels.get(COLOR_ACTIVE, str(COLOR_ACTIVE))
     muted_label  = labels.get(COLOR_MUTED,  str(COLOR_MUTED))
 
-    print("=" * 48)
-    print("  Maono PD100X - Mute LED Mod v2.0")
-    print("=" * 48)
+    maono_running = is_maono_link_running()
+
+    print("=" * 50)
+    print("  Maono PD100X - Mute LED Mod v3.0")
+    print("=" * 50)
     print(f"  Muteado  -> {muted_label} (idx={COLOR_MUTED})")
-    print(f"  Activo   -> {active_label} (idx={COLOR_ACTIVE})")
+    if COLOR_ACTIVE >= 10 and maono_running:
+        print(f"  Activo   -> {active_label} + esquema RGB {COLOR_SCHEME}")
+    else:
+        print(f"  Activo   -> {active_label} (idx={COLOR_ACTIVE})")
+    print(f"  Maono Link: {'corriendo' if maono_running else 'no detectado'}")
     print("  Ctrl+C para salir")
     print()
 
@@ -129,21 +161,36 @@ def main():
     time.sleep(0.15)
 
     last_muted = None
+    # Re-check Maono Link status periodically
+    maono_check_interval = 10
+    last_maono_check = time.time()
+
     try:
         while True:
+            # Periodically re-check if Maono Link started/stopped
+            if time.time() - last_maono_check > maono_check_interval:
+                new_status = is_maono_link_running()
+                if new_status != maono_running:
+                    maono_running = new_status
+                    print(f"[{time.strftime('%H:%M:%S')}] Maono Link {'detectado' if maono_running else 'cerrado'}")
+                    last_muted = None  # force LED refresh
+                last_maono_check = time.time()
+
             muted = read_mute_state(reader)
             if muted is None:
                 continue
             if muted != last_muted:
                 last_muted = muted
-                color = COLOR_MUTED if muted else COLOR_ACTIVE
-                send_led(k32, writer, CMD_LED, color)
+                if muted:
+                    send_led(k32, writer, CMD_LED, COLOR_MUTED)
+                else:
+                    apply_active_mode(k32, writer, maono_running)
                 label = muted_label if muted else active_label
                 print(f"[{time.strftime('%H:%M:%S')}] {'MUTEADO' if muted else 'ACTIVO '} -> {label}")
 
     except KeyboardInterrupt:
-        print("\nSaliendo - restaurando LED...")
-        send_led(k32, writer, CMD_LED, COLOR_ACTIVE)
+        print("\nSaliendo...")
+        apply_active_mode(k32, writer, maono_running)
 
     finally:
         reader.close()
