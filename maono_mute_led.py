@@ -69,15 +69,24 @@ def main():
     print("  Ctrl+C para salir")
     print()
 
-    # Abrir dispositivo
-    devs = hid.enumerate(VID, PID)
-    if not devs:
-        print("ERROR: PD100X no encontrado.")
-        sys.exit(1)
+    # Abrir dispositivo (reintenta hasta 60 segs para autostart con Windows)
+    dev = None
+    for attempt in range(12):
+        devs = hid.enumerate(VID, PID)
+        if devs:
+            try:
+                dev = hid.device()
+                dev.open_path(devs[0]['path'])
+                dev.set_nonblocking(True)
+                break
+            except Exception:
+                dev = None
+        print(f"Esperando mic... ({(attempt+1)*5}s)")
+        time.sleep(5)
 
-    dev = hid.device()
-    dev.open_path(devs[0]['path'])
-    dev.set_nonblocking(True)
+    if dev is None:
+        print("ERROR: PD100X no encontrado tras 60 segundos.")
+        sys.exit(1)
 
     # Enviar init sequence para activar status reports
     print("Inicializando firmware...")
